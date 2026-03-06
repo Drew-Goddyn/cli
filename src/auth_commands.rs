@@ -443,7 +443,7 @@ async fn handle_login(args: &[String]) -> Result<(), GwsError> {
 }
 
 /// Fetch the authenticated user's email from Google's userinfo endpoint.
-async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
+pub(crate) async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
     let client = match crate::client::build_client() {
         Ok(c) => c,
         Err(_) => return None,

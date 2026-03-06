@@ -86,19 +86,27 @@ pub async fn get_token(scopes: &[&str], account: Option<&str>) -> anyhow::Result
 
     // If env var credentials are specified, skip account resolution entirely
     if creds_file.is_some() {
-        let enc_path = credential_store::encrypted_credentials_path();
         let default_path = config_dir.join("credentials.json");
         let token_cache = config_dir.join("token_cache.json");
+        // When using env var creds, we don't need account-specific paths
+        let enc_path = PathBuf::from("/nonexistent");
         let creds = load_credentials_inner(creds_file.as_deref(), &enc_path, &default_path).await?;
         return get_token_inner(scopes, creds, &token_cache, impersonated_user.as_deref()).await;
     }
+
+    // Auto-migrate legacy credentials.enc if present and no accounts.json exists
+    migrate_legacy_credentials().await;
 
     // Resolve account from registry
     let resolved_account = resolve_account(account)?;
 
     let enc_path = match &resolved_account {
         Some(email) => credential_store::encrypted_credentials_path_for(email),
-        None => credential_store::encrypted_credentials_path(),
+        None => {
+            // No account resolved — no legacy fallback, just use a non-existent path
+            // so load_credentials_inner falls through to ADC/plaintext
+            config_dir.join("credentials.nonexistent.enc")
+        }
     };
 
     // Per-account token cache: token_cache.<b64-email>.json
@@ -125,7 +133,7 @@ pub async fn get_token(scopes: &[&str], account: Option<&str>) -> anyhow::Result
 /// Resolve which account to use:
 /// 1. Explicit `account` parameter takes priority.
 /// 2. Fall back to `accounts.json` default.
-/// 3. If no registry exists, return None to allow legacy `credentials.enc` fallthrough.
+/// 3. If no registry exists, return None (caller falls through to ADC/plaintext).
 fn resolve_account(account: Option<&str>) -> anyhow::Result<Option<String>> {
     let registry = crate::accounts::load_accounts()?;
 
@@ -161,13 +169,163 @@ fn resolve_account(account: Option<&str>) -> anyhow::Result<Option<String>> {
                 );
             }
         }
-        // No account, no registry — use legacy credentials if they exist
-        (None, None) => {
-            // Fall through to standard credential loading which will pick up
-            // the legacy credentials.enc file if it exists.
-            Ok(None)
-        }
+        // No account, no registry — no credentials to resolve
+        (None, None) => Ok(None),
     }
+}
+
+/// Auto-migrate legacy `credentials.enc` to the per-account format.
+///
+/// If `credentials.enc` exists and no `accounts.json` registry has been created
+/// yet, this function:
+/// 1. Decrypts the legacy file
+/// 2. Obtains an access token to determine the email via Google tokeninfo
+/// 3. Saves as `credentials.<b64-email>.enc`
+/// 4. Registers the account in `accounts.json` as default
+/// 5. Renames `credentials.enc` → `credentials.enc.bak`
+///
+/// On failure (e.g. offline, can't determine email), prints a warning and
+/// leaves the legacy file in place — the user can manually re-run `gws auth login`.
+async fn migrate_legacy_credentials() {
+    use std::sync::Once;
+    static MIGRATED: Once = Once::new();
+
+    let mut did_work = false;
+    MIGRATED.call_once(|| {
+        let legacy_path = credential_store::encrypted_credentials_path();
+        let registry = crate::accounts::load_accounts().ok().flatten();
+
+        // Only migrate if legacy file exists AND no accounts registry exists
+        if !legacy_path.exists() || registry.is_some() {
+            return;
+        }
+        did_work = true;
+    });
+
+    if !did_work {
+        return;
+    }
+
+    // Do the actual async migration work outside call_once
+    let legacy_path = credential_store::encrypted_credentials_path();
+    if !legacy_path.exists() {
+        return;
+    }
+    let registry = crate::accounts::load_accounts().ok().flatten();
+    if registry.is_some() {
+        return;
+    }
+
+    eprintln!("[gws] Migrating legacy credentials to per-account format...");
+
+    // Decrypt the legacy credentials
+    let json_str = match credential_store::load_encrypted() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[gws] Warning: Failed to decrypt legacy credentials: {e}");
+            eprintln!("[gws] Run 'gws auth login' to re-authenticate.");
+            return;
+        }
+    };
+
+    // Parse credentials to get refresh_token
+    let creds: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[gws] Warning: Failed to parse legacy credentials: {e}");
+            return;
+        }
+    };
+
+    let client_id = creds["client_id"].as_str().unwrap_or_default();
+    let client_secret = creds["client_secret"].as_str().unwrap_or_default();
+    let refresh_token = creds["refresh_token"].as_str().unwrap_or_default();
+
+    if client_id.is_empty() || client_secret.is_empty() || refresh_token.is_empty() {
+        eprintln!("[gws] Warning: Legacy credentials are incomplete, cannot migrate.");
+        eprintln!("[gws] Run 'gws auth login' to re-authenticate.");
+        return;
+    }
+
+    // Get an access token to determine the email
+    let secret = yup_oauth2::authorized_user::AuthorizedUserSecret {
+        client_id: client_id.to_string(),
+        client_secret: client_secret.to_string(),
+        refresh_token: refresh_token.to_string(),
+        key_type: "authorized_user".to_string(),
+    };
+
+    let auth = match yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
+        .build()
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[gws] Warning: Failed to build authenticator for migration: {e}");
+            eprintln!("[gws] Run 'gws auth login' to re-authenticate.");
+            return;
+        }
+    };
+
+    let token = match auth
+        .token(&["https://www.googleapis.com/auth/userinfo.email"])
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[gws] Warning: Failed to get token for migration: {e}");
+            eprintln!("[gws] Run 'gws auth login' to re-authenticate.");
+            return;
+        }
+    };
+
+    let access_token = match token.token() {
+        Some(t) => t.to_string(),
+        None => {
+            eprintln!("[gws] Warning: No access token available for migration.");
+            return;
+        }
+    };
+
+    // Get email via tokeninfo
+    let email = match crate::auth_commands::fetch_userinfo_email(&access_token).await {
+        Some(e) => e,
+        None => {
+            eprintln!("[gws] Warning: Could not determine email from legacy credentials.");
+            eprintln!("[gws] Run 'gws auth login' to re-authenticate.");
+            return;
+        }
+    };
+
+    eprintln!("[gws] Found account: {email}");
+
+    // Save as per-account credentials
+    if let Err(e) = credential_store::save_encrypted_for(&json_str, &email) {
+        eprintln!("[gws] Warning: Failed to save migrated credentials: {e}");
+        return;
+    }
+
+    // Register in accounts.json using the existing helper
+    let mut registry = crate::accounts::AccountsRegistry::default();
+    crate::accounts::add_account(&mut registry, &email);
+
+    if let Err(e) = crate::accounts::save_accounts(&registry) {
+        eprintln!("[gws] Warning: Failed to save accounts registry: {e}");
+        return;
+    }
+
+    // Rename legacy file to .bak
+    let backup_path = legacy_path.with_extension("enc.bak");
+    if let Err(e) = std::fs::rename(&legacy_path, &backup_path) {
+        eprintln!("[gws] Warning: Failed to rename legacy credentials: {e}");
+        // Still succeeded in migration, just couldn't clean up
+    }
+
+    eprintln!(
+        "[gws] ✓ Migrated credentials for {}. Backup at {}",
+        email,
+        backup_path.display()
+    );
 }
 
 async fn get_token_inner(
