@@ -200,21 +200,31 @@ pub async fn fetch_discovery_document(
 
     let cache_file = cache_dir.join(format!("{service}_{version}.json"));
 
+    let api_base_override = std::env::var("GOOGLE_WORKSPACE_CLI_API_BASE").ok();
+
     // Check cache (24hr TTL)
     if cache_file.exists() {
         if let Ok(metadata) = std::fs::metadata(&cache_file) {
             if let Ok(modified) = metadata.modified() {
                 if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(86400) {
                     let data = std::fs::read_to_string(&cache_file)?;
-                    let doc: RestDescription = serde_json::from_str(&data)?;
+                    let mut doc: RestDescription = serde_json::from_str(&data)?;
+                    if let Some(ref override_url) = api_base_override {
+                        let base = override_url.trim_end_matches('/');
+                        doc.root_url = format!("{base}/");
+                        doc.base_url = Some(format!("{base}/{}", doc.service_path));
+                    }
                     return Ok(doc);
                 }
             }
         }
     }
 
+    let discovery_base = api_base_override.as_deref().unwrap_or("https://www.googleapis.com");
+
     let url = format!(
-        "https://www.googleapis.com/discovery/v1/apis/{}/{}/rest",
+        "{}/discovery/v1/apis/{}/{}/rest",
+        discovery_base,
         crate::validate::encode_path_segment(service),
         crate::validate::encode_path_segment(version),
     );
@@ -225,8 +235,9 @@ pub async fn fetch_discovery_document(
     let body = if resp.status().is_success() {
         resp.text().await?
     } else {
-        // Try the $discovery/rest URL pattern used by newer APIs (Forms, Keep, Meet, etc.)
-        let alt_url = format!("https://{service}.googleapis.com/$discovery/rest");
+        let default_alt_base = format!("https://{service}.googleapis.com");
+        let alt_base = api_base_override.as_deref().unwrap_or(&default_alt_base);
+        let alt_url = format!("{alt_base}/$discovery/rest");
         let alt_resp = client
             .get(&alt_url)
             .query(&[("version", version)])
@@ -243,11 +254,17 @@ pub async fn fetch_discovery_document(
 
     // Write to cache
     if let Err(e) = std::fs::write(&cache_file, &body) {
-        // Non-fatal: just warn via stderr-safe approach
         let _ = e;
     }
 
-    let doc: RestDescription = serde_json::from_str(&body)?;
+    let mut doc: RestDescription = serde_json::from_str(&body)?;
+
+    if let Some(ref override_url) = api_base_override {
+        let base = override_url.trim_end_matches('/');
+        doc.root_url = format!("{base}/");
+        doc.base_url = Some(format!("{base}/{}", doc.service_path));
+    }
+
     Ok(doc)
 }
 
