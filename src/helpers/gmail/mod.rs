@@ -42,7 +42,8 @@ pub(super) const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/g
 pub(super) const PUBSUB_SCOPE: &str = "https://www.googleapis.com/auth/pubsub";
 
 pub(super) fn gmail_api_base() -> String {
-    std::env::var("GOOGLE_WORKSPACE_CLI_GMAIL_API_BASE")
+    std::env::var("GOOGLE_WORKSPACE_CLI_API_RELAY")
+        .or_else(|_| std::env::var("GOOGLE_WORKSPACE_CLI_GMAIL_API_BASE"))
         .unwrap_or_else(|_| "https://gmail.googleapis.com".to_string())
         .trim_end_matches('/')
         .to_string()
