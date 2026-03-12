@@ -200,20 +200,26 @@ pub async fn fetch_discovery_document(
 
     let cache_file = cache_dir.join(format!("{service}_{version}.json"));
 
+    let relay = std::env::var("GOOGLE_WORKSPACE_CLI_API_RELAY").ok();
+
     // Check cache (24hr TTL)
     if cache_file.exists() {
         if let Ok(metadata) = std::fs::metadata(&cache_file) {
             if let Ok(modified) = metadata.modified() {
                 if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(86400) {
                     let data = std::fs::read_to_string(&cache_file)?;
-                    let doc: RestDescription = serde_json::from_str(&data)?;
+                    let mut doc: RestDescription = serde_json::from_str(&data)?;
+                    if let Some(ref relay_url) = relay {
+                        let base = relay_url.trim_end_matches('/');
+                        doc.root_url = format!("{base}/");
+                        doc.base_url = Some(format!("{base}/{}", doc.service_path));
+                    }
                     return Ok(doc);
                 }
             }
         }
     }
 
-    let relay = std::env::var("GOOGLE_WORKSPACE_CLI_API_RELAY").ok();
     let discovery_base = relay.as_deref().unwrap_or("https://www.googleapis.com");
 
     let url = format!(
